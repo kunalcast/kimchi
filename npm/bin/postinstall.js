@@ -377,8 +377,6 @@ async function main() {
     ).version;
   }
   const tag = resolveVersion(packageVersion);
-
-  const downloadUrl = buildDownloadUrl(tag, asset);
   const checksumUrl = buildChecksumUrl(tag);
 
   // Destination: a platform-specific subdirectory inside the package
@@ -398,9 +396,23 @@ async function main() {
 
   mkdirSync(destDir, { recursive: true });
 
-  // Download the archive
+  // Download the archive.
+  // Try the version-specific tag first (for reproducibility).
+  // If that 404s (e.g. npm patch without a matching GitHub release),
+  // fall back to "latest" so the install always succeeds.
+  let downloadUrl = buildDownloadUrl(tag, asset);
   console.log(`[kimchi] Downloading ${asset} (${key})…`);
-  await downloadFile(downloadUrl, archivePath);
+  try {
+    await downloadFile(downloadUrl, archivePath);
+  } catch (err) {
+    if (err.statusCode === 404 && tag !== "latest") {
+      console.warn(`[kimchi] Version ${tag} not found on GitHub Releases, falling back to latest.`);
+      downloadUrl = buildDownloadUrl("latest", asset);
+      await downloadFile(downloadUrl, archivePath);
+    } else {
+      throw err;
+    }
+  }
 
   // Download and verify checksum
   // - If checksum download fails: warn and continue (best-effort)
@@ -408,7 +420,11 @@ async function main() {
   const checksumsPath = path.join(destDir, "checksums.txt");
   let checksumVerified = false;
   try {
-    await downloadFile(checksumUrl, checksumsPath);
+    // Use the same URL base as the archive download (may have fallen back to latest)
+    const effectiveChecksumUrl = downloadUrl.includes("/latest/download/")
+      ? buildChecksumUrl("latest")
+      : checksumUrl;
+    await downloadFile(effectiveChecksumUrl, checksumsPath);
     const checksumsContent = fs.readFileSync(checksumsPath, "utf8");
     await verifyChecksum(archivePath, asset, checksumsContent);
     console.log(`[kimchi] Checksum verified ✓`);
