@@ -56,7 +56,10 @@ function getProxyUrl(targetUrl) {
 }
 
 /**
- * Creates an HTTP request using the given URL, with optional proxy support.
+ * Creates an HTTPS GET request with optional proxy support.
+ * If a proxy is configured, establishes a CONNECT tunnel first.
+ * Returns the actual https.ClientRequest so timeout/error handlers
+ * are attached to the correct request object.
  *
  * @param {string} url
  * @param {Object} options
@@ -65,34 +68,61 @@ function getProxyUrl(targetUrl) {
  */
 function httpRequest(url, options, callback) {
   const proxyUrl = getProxyUrl(url);
-  if (proxyUrl) {
-    const proxy = new URL(proxyUrl);
-    const target = new URL(url);
-    // CONNECT method via HTTP proxy for HTTPS targets.
-    // The socket from the CONNECT response is reused for the HTTPS request.
-    const connectReq = http.request({
-      host: proxy.hostname,
-      port: proxy.port || 80,
-      method: "CONNECT",
-      path: `${target.hostname}:${target.port || 443}`,
-      headers: { Host: `${target.hostname}:${target.port || 443}` },
-      agent: false,
-    });
-    connectReq.on("connect", (_res, socket) => {
-      // Use the established tunnel socket for the HTTPS request.
-      // Do NOT destroy connectReq — that would close the socket.
-      const req = https.get(url, { ...options, socket, agent: false }, callback);
-      req.on("error", (err) => {
-        callback(null, err);
-      });
-    });
-    connectReq.on("error", (err) => {
-      callback(null, err);
-    });
-    connectReq.end();
-    return connectReq;
+  if (!proxyUrl) {
+    return https.get(url, options, callback);
   }
-  return https.get(url, options, callback);
+
+  const proxy = new URL(proxyUrl);
+  const target = new URL(url);
+  let settled = false;
+
+  // Establish a CONNECT tunnel through the proxy
+  const connectReq = http.request({
+    host: proxy.hostname,
+    port: proxy.port || 80,
+    method: "CONNECT",
+    path: `${target.hostname}:${target.port || 443}`,
+    headers: { Host: `${target.hostname}:${target.port || 443}` },
+    agent: false,
+  });
+
+  connectReq.on("connect", (res, socket) => {
+    if (settled) return;
+    // Check CONNECT response status
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      settled = true;
+      callback(null, new Error(`Proxy CONNECT failed: HTTP ${res.statusCode}`));
+      return;
+    }
+    // Use the established tunnel socket for the HTTPS request.
+    const req = https.get(url, { ...options, socket, agent: false }, callback);
+    req.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        callback(null, err);
+      }
+    });
+  });
+
+  // Handle proxy errors (connection refused, timeout, etc.)
+  connectReq.on("error", (err) => {
+    if (!settled) {
+      settled = true;
+      callback(null, err);
+    }
+  });
+
+  // Handle non-CONNECT responses (e.g., 407 Proxy Auth Required)
+  connectReq.on("response", (res) => {
+    if (!settled) {
+      settled = true;
+      res.resume();
+      callback(null, new Error(`Proxy returned HTTP ${res.statusCode} (expected CONNECT tunnel)`));
+    }
+  });
+
+  connectReq.end();
+  return connectReq;
 }
 
 const REPO = "getkimchi/kimchi";
