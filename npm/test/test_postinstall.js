@@ -25,6 +25,7 @@ const {
   verifyChecksum,
   extractArchive,
   makeExecutable,
+  getProxyUrl,
   REPO,
 } = require("../bin/postinstall");
 
@@ -70,12 +71,14 @@ describe("resolvePlatform", () => {
   });
 
   test("error message includes supported platforms list", () => {
-    try {
-      resolvePlatform(platforms, "aix", "ppc64");
-    } catch (err) {
-      assert.ok(err.message.includes("darwin-arm64"));
-      assert.ok(err.message.includes("win32-x64"));
-    }
+    assert.throws(
+      () => resolvePlatform(platforms, "aix", "ppc64"),
+      (err) => {
+        assert.ok(err.message.includes("darwin-arm64"));
+        assert.ok(err.message.includes("win32-x64"));
+        return true;
+      }
+    );
   });
 });
 
@@ -181,6 +184,12 @@ describe("isRetryableError", () => {
   test("retries on 503 service unavailable", () => {
     const err = new Error("HTTP 503");
     err.statusCode = 503;
+    assert.strictEqual(isRetryableError(err), true);
+  });
+
+  test("retries on 429 too many requests", () => {
+    const err = new Error("HTTP 429");
+    err.statusCode = 429;
     assert.strictEqual(isRetryableError(err), true);
   });
 
@@ -317,50 +326,63 @@ describe("parseChecksums", () => {
 });
 
 describe("verifyChecksum", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimchi-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   test("returns true when checksum matches", async () => {
-    // Create a temp file with known content
-    const tmpFile = path.join(os.tmpdir(), "kimchi-test-checksum.txt");
+    const tmpFile = path.join(tmpDir, "checksum.txt");
     fs.writeFileSync(tmpFile, "test content");
 
     const hash = await computeSha256(tmpFile);
-    const checksumsContent = `${hash}  kimchi-test-checksum.txt\n`;
+    const checksumsContent = `${hash}  checksum.txt\n`;
 
-    const result = await verifyChecksum(tmpFile, "kimchi-test-checksum.txt", checksumsContent);
+    const result = await verifyChecksum(tmpFile, "checksum.txt", checksumsContent);
     assert.strictEqual(result, true);
-
-    fs.unlinkSync(tmpFile);
   });
 
   test("throws when checksum doesn't match", async () => {
-    const tmpFile = path.join(os.tmpdir(), "kimchi-test-checksum-bad.txt");
+    const tmpFile = path.join(tmpDir, "checksum-bad.txt");
     fs.writeFileSync(tmpFile, "different content");
 
-    const checksumsContent = `0000000000000000000000000000000000000000000000000000000000000000  kimchi-test-checksum-bad.txt\n`;
+    const checksumsContent = `0000000000000000000000000000000000000000000000000000000000000000  checksum-bad.txt\n`;
 
     await assert.rejects(
-      async () => verifyChecksum(tmpFile, "kimchi-test-checksum-bad.txt", checksumsContent),
+      async () => verifyChecksum(tmpFile, "checksum-bad.txt", checksumsContent),
       /Checksum mismatch/
     );
-
-    fs.unlinkSync(tmpFile);
   });
 
   test("throws when asset not in checksums", async () => {
-    const tmpFile = path.join(os.tmpdir(), "kimchi-test-checksum-missing.txt");
+    const tmpFile = path.join(tmpDir, "checksum-missing.txt");
     fs.writeFileSync(tmpFile, "content");
 
     await assert.rejects(
       async () => verifyChecksum(tmpFile, "nonexistent-asset.tar.gz", "otherhash  other.tar.gz\n"),
       /No checksum found/
     );
-
-    fs.unlinkSync(tmpFile);
   });
 });
 
 describe("computeSha256", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimchi-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   test("computes consistent hash", async () => {
-    const tmpFile = path.join(os.tmpdir(), "kimchi-test-hash.txt");
+    const tmpFile = path.join(tmpDir, "hash.txt");
     fs.writeFileSync(tmpFile, "hello world");
 
     const hash1 = await computeSha256(tmpFile);
@@ -368,8 +390,6 @@ describe("computeSha256", () => {
 
     assert.strictEqual(hash1, hash2);
     assert.strictEqual(hash1.length, 64); // SHA-256 hex
-
-    fs.unlinkSync(tmpFile);
   });
 });
 
@@ -494,5 +514,58 @@ describe("getPlatformKey", () => {
   test("uses process defaults when no args given", () => {
     const key = getPlatformKey();
     assert.strictEqual(key, `${process.platform}-${process.arch}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Proxy support
+// ---------------------------------------------------------------------------
+
+describe("getProxyUrl", () => {
+  const origEnv = { ...process.env };
+
+  afterEach(() => {
+    // Restore env
+    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]) {
+      if (key in origEnv) process.env[key] = origEnv[key];
+      else delete process.env[key];
+    }
+  });
+
+  test("returns null when no proxy env vars are set", () => {
+    delete process.env.HTTP_PROXY;
+    delete process.env.HTTPS_PROXY;
+    delete process.env.http_proxy;
+    delete process.env.https_proxy;
+    assert.strictEqual(getProxyUrl("https://github.com/test"), null);
+  });
+
+  test("returns HTTPS_PROXY for https URLs", () => {
+    process.env.HTTPS_PROXY = "http://proxy.example.com:8080";
+    assert.strictEqual(getProxyUrl("https://github.com/test"), "http://proxy.example.com:8080");
+  });
+
+  test("returns HTTP_PROXY for http URLs", () => {
+    process.env.HTTP_PROXY = "http://proxy.example.com:8080";
+    delete process.env.HTTPS_PROXY;
+    assert.strictEqual(getProxyUrl("http://github.com/test"), "http://proxy.example.com:8080");
+  });
+
+  test("respects NO_PROXY for exact hostname match", () => {
+    process.env.HTTPS_PROXY = "http://proxy.example.com:8080";
+    process.env.NO_PROXY = "github.com";
+    assert.strictEqual(getProxyUrl("https://github.com/test"), null);
+  });
+
+  test("respects NO_PROXY for subdomain match", () => {
+    process.env.HTTPS_PROXY = "http://proxy.example.com:8080";
+    process.env.NO_PROXY = "github.com";
+    assert.strictEqual(getProxyUrl("https://api.github.com/test"), null);
+  });
+
+  test("returns proxy when hostname not in NO_PROXY", () => {
+    process.env.HTTPS_PROXY = "http://proxy.example.com:8080";
+    process.env.NO_PROXY = "other.com";
+    assert.strictEqual(getProxyUrl("https://github.com/test"), "http://proxy.example.com:8080");
   });
 });

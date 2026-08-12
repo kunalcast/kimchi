@@ -68,7 +68,8 @@ function httpRequest(url, options, callback) {
   if (proxyUrl) {
     const proxy = new URL(proxyUrl);
     const target = new URL(url);
-    // CONNECT method via HTTP proxy for HTTPS targets
+    // CONNECT method via HTTP proxy for HTTPS targets.
+    // The socket from the CONNECT response is reused for the HTTPS request.
     const connectReq = http.request({
       host: proxy.hostname,
       port: proxy.port || 80,
@@ -78,9 +79,12 @@ function httpRequest(url, options, callback) {
       agent: false,
     });
     connectReq.on("connect", (_res, socket) => {
+      // Use the established tunnel socket for the HTTPS request.
+      // Do NOT destroy connectReq — that would close the socket.
       const req = https.get(url, { ...options, socket, agent: false }, callback);
-      req.on("error", () => {});
-      connectReq.destroy();
+      req.on("error", (err) => {
+        callback(null, err);
+      });
     });
     connectReq.on("error", (err) => {
       callback(null, err);
@@ -540,20 +544,30 @@ async function main() {
   // Clean up the archive after extraction
   rmSync(archivePath, { force: true });
 
-  // Safety check: verify the binary exists after extraction and its path
-  // is within destDir (protects against path traversal or unexpected archive layout)
+  // Safety check: walk extracted files and verify none escaped destDir
+  // (protects against path traversal via ../ or absolute paths in archive)
+  const resolvedDest = path.resolve(destDir) + path.sep;
+  const walkAndVerify = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.resolve(dir, entry.name);
+      if (!fullPath.startsWith(resolvedDest) && fullPath !== path.resolve(destDir)) {
+        throw new Error(
+          `Extracted path ${fullPath} is outside the destination directory. ` +
+          `The archive may contain path traversal entries. Aborting.`
+        );
+      }
+      if (entry.isDirectory()) {
+        walkAndVerify(fullPath);
+      }
+    }
+  };
+  walkAndVerify(destDir);
+
+  // Verify the binary exists after extraction
   if (!existsSync(binaryExePath)) {
     throw new Error(
       `Binary not found at ${binaryExePath} after extraction. ` +
       `The archive may have an unexpected directory structure.`
-    );
-  }
-  const resolvedBinary = path.resolve(binaryExePath);
-  const resolvedDest = path.resolve(destDir);
-  if (!resolvedBinary.startsWith(resolvedDest + path.sep)) {
-    throw new Error(
-      `Binary path ${resolvedBinary} is outside the destination directory ${resolvedDest}. ` +
-      `The archive may contain path traversal entries. Aborting.`
     );
   }
 

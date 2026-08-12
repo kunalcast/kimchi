@@ -5,7 +5,7 @@
 
 "use strict";
 
-const { test, describe, afterEach, beforeEach } = require("node:test");
+const { test, describe, afterEach } = require("node:test");
 const assert = require("node:assert");
 const path = require("node:path");
 const fs = require("node:fs");

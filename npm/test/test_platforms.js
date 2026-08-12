@@ -11,6 +11,9 @@ const fs = require("node:fs");
 const platformsPath = path.join(__dirname, "..", "bin", "platforms.json");
 const platforms = JSON.parse(fs.readFileSync(platformsPath, "utf8"));
 
+// Import the real function from postinstall.js
+const { getPlatformKey } = require("../bin/postinstall");
+
 const SUPPORTED_KEYS = [
   "darwin-arm64",
   "darwin-x64",
@@ -64,12 +67,6 @@ describe("platforms.json structure", () => {
 });
 
 describe("platform key resolution", () => {
-  // Simulate the getPlatformKey function logic
-  function getPlatformKey(platform, arch) {
-    // Node reports 'x64' but Go/asset naming uses 'amd64'
-    // platforms.json already maps node's x64 to the amd64 asset name
-    return `${platform}-${arch}`;
-  }
 
   test("darwin arm64 resolves to correct key", () => {
     const key = getPlatformKey("darwin", "arm64");
@@ -101,7 +98,7 @@ describe("platform key resolution", () => {
     assert.strictEqual(platforms[key].asset, "kimchi_windows_amd64.zip");
   });
 
-  test("unsupported platform throws error", () => {
+  test("unsupported platform key is not in platforms.json", () => {
     const key = getPlatformKey("freebsd", "x64");
     assert.ok(!(key in platforms), "freebsd should not be supported");
   });

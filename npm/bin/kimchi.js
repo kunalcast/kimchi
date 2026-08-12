@@ -57,9 +57,8 @@ function resolveBinaryPath(opts = {}) {
     if (exists(binaryPath)) return binaryPath;
   }
 
-  // 3. Fallback: system-installed kimchi (on PATH)
-  // We return the string "kimchi" so spawn() searches PATH.
-  // The caller should check if it actually exists before spawning.
+  // 3. No binary found — return null. The caller (runKimchi) handles
+  //    the fallback to a system-installed 'kimchi' on PATH.
   return null;
 }
 
@@ -127,7 +126,10 @@ function runKimchi(args, opts = {}) {
 
 if (require.main === module) {
   const args = process.argv.slice(2);
-  runKimchi(args).then((code) => process.exit(code));
+  runKimchi(args).then((code) => {
+    // Use exitCode instead of exit() so buffered stdio can flush
+    process.exitCode = code;
+  });
 }
 
 module.exports = { resolveBinaryPath, runKimchi };
