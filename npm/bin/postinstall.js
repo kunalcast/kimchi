@@ -24,9 +24,72 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const https = require("node:https");
+const http = require("node:http");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const { createWriteStream, mkdirSync, rmSync, existsSync, chmodSync } = require("node:fs");
+
+// ---------------------------------------------------------------------------
+// Proxy support
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the proxy URL based on env vars, or null if no proxy is configured.
+ * Respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY (for GitHub hostnames).
+ *
+ * @param {string} targetUrl
+ * @returns {string|null}
+ */
+function getProxyUrl(targetUrl) {
+  const parsed = new URL(targetUrl);
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
+  const noProxyHosts = noProxy.split(",").map(h => h.trim()).filter(Boolean);
+  for (const host of noProxyHosts) {
+    if (parsed.hostname === host || parsed.hostname.endsWith("." + host)) {
+      return null;
+    }
+  }
+  if (parsed.protocol === "https:") {
+    return process.env.HTTPS_PROXY || process.env.https_proxy || null;
+  }
+  return process.env.HTTP_PROXY || process.env.http_proxy || null;
+}
+
+/**
+ * Creates an HTTP request using the given URL, with optional proxy support.
+ *
+ * @param {string} url
+ * @param {Object} options
+ * @param {Function} callback
+ * @returns {http.ClientRequest}
+ */
+function httpRequest(url, options, callback) {
+  const proxyUrl = getProxyUrl(url);
+  if (proxyUrl) {
+    const proxy = new URL(proxyUrl);
+    const target = new URL(url);
+    // CONNECT method via HTTP proxy for HTTPS targets
+    const connectReq = http.request({
+      host: proxy.hostname,
+      port: proxy.port || 80,
+      method: "CONNECT",
+      path: `${target.hostname}:${target.port || 443}`,
+      headers: { Host: `${target.hostname}:${target.port || 443}` },
+      agent: false,
+    });
+    connectReq.on("connect", (_res, socket) => {
+      const req = https.get(url, { ...options, socket, agent: false }, callback);
+      req.on("error", () => {});
+      connectReq.destroy();
+    });
+    connectReq.on("error", (err) => {
+      callback(null, err);
+    });
+    connectReq.end();
+    return connectReq;
+  }
+  return https.get(url, options, callback);
+}
 
 const REPO = "getkimchi/kimchi";
 const PLATFORMS_PATH = path.join(__dirname, "platforms.json");
@@ -110,8 +173,8 @@ function buildChecksumUrl(tag) {
 
 /**
  * Classifies an error to determine if it's retryable.
- * Only transient network errors (timeouts, connection resets, 5xx) are retried.
- * Client errors (404, 403) fail immediately.
+ * Only transient network errors (timeouts, connection resets, 429, 5xx) are retried.
+ * Client errors (404, 403, etc.) fail immediately.
  *
  * @param {Error} err
  * @returns {boolean} — true if the error is retryable
@@ -119,6 +182,10 @@ function buildChecksumUrl(tag) {
 function isRetryableError(err) {
   // Non-HTTP errors (network, timeout) are always retryable
   if (!err.statusCode) {
+    return true;
+  }
+  // 429 Too Many Requests is retryable (rate limiting is transient)
+  if (err.statusCode === 429) {
     return true;
   }
   // 5xx server errors are retryable
@@ -140,7 +207,7 @@ function isRetryableError(err) {
  */
 function defaultFetch(url, destPath, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
-    const req = https.get(
+    const req = httpRequest(
       url,
       {
         headers: {
@@ -148,7 +215,11 @@ function defaultFetch(url, destPath, redirectsLeft = 5) {
           Accept: "application/octet-stream",
         },
       },
-      (res) => {
+      (res, connectErr) => {
+        if (connectErr) {
+          reject(connectErr);
+          return;
+        }
         if (
           (res.statusCode === 301 ||
             res.statusCode === 302 ||
@@ -244,7 +315,8 @@ function computeSha256(filePath) {
   stream.pipe(hash);
   return new Promise((resolve, reject) => {
     stream.on("error", reject);
-    stream.on("end", () => resolve(hash.digest("hex")));
+    hash.on("error", reject);
+    hash.on("finish", () => resolve(hash.digest("hex")));
   });
 }
 
@@ -313,8 +385,11 @@ function extractArchive(archivePath, archiveType, destDir, opts = {}) {
   mkdirSync(destDir, { recursive: true });
 
   if (archiveType === "tar.gz") {
-    // tar is available on all Unix systems; Windows 10+ ships tar.exe
-    const result = spawnSyncImpl("tar", ["-xzf", archivePath, "-C", destDir], {
+    // tar is available on all Unix systems; Windows 10+ ships tar.exe.
+    // We don't use --no-same-owner because busybox tar (Alpine) doesn't support it.
+    // UID/GID warnings when running as root are harmless.
+    const tarArgs = ["-xzf", archivePath, "-C", destDir];
+    const result = spawnSyncImpl("tar", tarArgs, {
       stdio: "inherit",
     });
     if (result.error) throw result.error;
@@ -323,16 +398,24 @@ function extractArchive(archivePath, archiveType, destDir, opts = {}) {
     }
   } else if (archiveType === "zip") {
     if ((opts.platform ?? process.platform) === "win32") {
-      // Use PowerShell with argument array (no string interpolation)
-      const result = spawnSyncImpl(
+      // Use PowerShell with -EncodedCommand (base64 UTF-16LE) to avoid
+      // any string interpolation of paths into the command string.
+      // Try powershell.exe (Windows PowerShell 5) first, fall back to pwsh (PowerShell 7+).
+      const script = `Expand-Archive -LiteralPath '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`;
+      const encoded = Buffer.from(script, "utf16le").toString("base64");
+      let result = spawnSyncImpl(
         "powershell.exe",
-        [
-          "-NoProfile",
-          "-Command",
-          `Expand-Archive -Path '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`,
-        ],
+        ["-NoProfile", "-EncodedCommand", encoded],
         { stdio: "inherit" }
       );
+      if (result.error && result.error.code === "ENOENT") {
+        // powershell.exe not found, try pwsh (PowerShell 7+)
+        result = spawnSyncImpl(
+          "pwsh",
+          ["-NoProfile", "-EncodedCommand", encoded],
+          { stdio: "inherit" }
+        );
+      }
       if (result.error) throw result.error;
       if (result.status !== 0) {
         throw new Error(`PowerShell extraction failed with exit code ${result.status}`);
@@ -368,6 +451,12 @@ function makeExecutable(binaryPath, opts = {}) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+// Main — orchestrates download, checksum verification, and extraction.
+// Unit tests cover individual helpers (downloadFile, verifyChecksum,
+// extractArchive). End-to-end coverage of main() is provided by
+// .github/workflows/test-npm.yml which installs from tarball across
+// Windows/Linux/macOS and verifies the binary executes.
+// ---------------------------------------------------------------------------
 
 async function main() {
   const platforms = loadPlatforms();
@@ -383,7 +472,6 @@ async function main() {
   }
   const tag = resolveVersion(packageVersion);
 
-  const downloadUrl = buildDownloadUrl(tag, asset);
   const checksumUrl = buildChecksumUrl(tag);
 
   // Destination: a platform-specific subdirectory inside the package
@@ -403,33 +491,46 @@ async function main() {
 
   mkdirSync(destDir, { recursive: true });
 
-  // Download the archive
+  // Download the archive.
+  // Try the version-specific tag first (for reproducibility).
+  // If that 404s (e.g. npm patch without a matching GitHub release),
+  // fall back to "latest" so the install always succeeds.
+  let effectiveTag = tag;
+  let downloadUrl = buildDownloadUrl(tag, asset);
   console.log(`[kimchi] Downloading ${asset} (${key})…`);
-  await downloadFile(downloadUrl, archivePath);
-
-  // Download and verify checksum
-  // - If checksum download fails: warn and continue (best-effort)
-  // - If checksum MISMATCH: fail closed (delete archive, don't extract)
-  const checksumsPath = path.join(destDir, "checksums.txt");
-  let checksumVerified = false;
   try {
-    await downloadFile(checksumUrl, checksumsPath);
+    await downloadFile(downloadUrl, archivePath);
+  } catch (err) {
+    if (err.statusCode === 404 && tag !== "latest") {
+      console.warn(`[kimchi] Version ${tag} not found on GitHub Releases, falling back to latest.`);
+      effectiveTag = "latest";
+      downloadUrl = buildDownloadUrl("latest", asset);
+      await downloadFile(downloadUrl, archivePath);
+    } else {
+      throw err;
+    }
+  }
+
+  // Download and verify checksum.
+  // Security: fail closed on ANY checksum issue — download failure, mismatch,
+  // or missing entry. The archive is deleted and extraction does NOT proceed.
+  // This ensures a tampered or corrupted binary can never be installed.
+  const checksumsPath = path.join(destDir, "checksums.txt");
+  const effectiveChecksumUrl = buildChecksumUrl(effectiveTag);
+  try {
+    await downloadFile(effectiveChecksumUrl, checksumsPath);
     const checksumsContent = fs.readFileSync(checksumsPath, "utf8");
     await verifyChecksum(archivePath, asset, checksumsContent);
     console.log(`[kimchi] Checksum verified ✓`);
-    checksumVerified = true;
     rmSync(checksumsPath, { force: true });
   } catch (err) {
-    if (err.message.includes("Checksum mismatch") || err.message.includes("No checksum found")) {
-      // Checksum mismatch — fail closed. Delete the archive and stop.
-      rmSync(archivePath, { force: true });
-      throw new Error(
-        `Checksum verification FAILED for ${asset}: ${err.message}\n` +
-        `The downloaded archive may be corrupted or tampered with. Aborting.`
-      );
-    }
-    // Checksum download failed — warn but continue (best-effort)
-    console.warn(`[kimchi] Checksum verification skipped: ${err.message}`);
+    // Any failure (download error, mismatch, or missing entry) — fail closed.
+    rmSync(archivePath, { force: true });
+    rmSync(checksumsPath, { force: true });
+    throw new Error(
+      `Checksum verification FAILED for ${asset}: ${err.message}\n` +
+      `The downloaded archive may be corrupted or tampered with. Aborting.`
+    );
   }
 
   // Extract
@@ -439,19 +540,51 @@ async function main() {
   // Clean up the archive after extraction
   rmSync(archivePath, { force: true });
 
+  // Safety check: verify the binary exists after extraction and its path
+  // is within destDir (protects against path traversal or unexpected archive layout)
+  if (!existsSync(binaryExePath)) {
+    throw new Error(
+      `Binary not found at ${binaryExePath} after extraction. ` +
+      `The archive may have an unexpected directory structure.`
+    );
+  }
+  const resolvedBinary = path.resolve(binaryExePath);
+  const resolvedDest = path.resolve(destDir);
+  if (!resolvedBinary.startsWith(resolvedDest + path.sep)) {
+    throw new Error(
+      `Binary path ${resolvedBinary} is outside the destination directory ${resolvedDest}. ` +
+      `The archive may contain path traversal entries. Aborting.`
+    );
+  }
+
   makeExecutable(binaryPath);
 
   console.log(`[kimchi] Installed binary to ${binaryExePath}`);
 }
 
-// Run main, but never fail the install
+// Run main. On failure, decide whether to block the install:
+// - Security errors (checksum failure, path traversal) MUST exit non-zero
+//   so npm knows the package is broken and doesn't install a tampered binary.
+// - Network/tooling errors (download timeout, missing tar) exit 0 so npm
+//   install is not blocked — the user can install kimchi separately.
 if (require.main === module) {
   main().catch((err) => {
+    const isSecurityError =
+      err.message.includes("Checksum verification FAILED") ||
+      err.message.includes("path traversal") ||
+      err.message.includes("outside the destination directory");
+
     console.warn(
       `[kimchi] postinstall failed: ${err.message}\n` +
         `[kimchi] You can still use the package if Kimchi is installed separately.\n` +
         `[kimchi] Or download manually from https://github.com/${REPO}/releases`
     );
+
+    // Security failures: exit non-zero to block the install
+    if (isSecurityError) {
+      process.exit(1);
+    }
+    // Network/tooling failures: exit 0 to not block npm install
     process.exit(0);
   });
 }
@@ -472,5 +605,6 @@ module.exports = {
   verifyChecksum,
   extractArchive,
   makeExecutable,
+  getProxyUrl,
   REPO,
 };
