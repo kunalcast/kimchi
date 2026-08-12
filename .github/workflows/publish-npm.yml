@@ -1,0 +1,50 @@
+name: Publish @getkimchi/kimchi to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 0.1.91)'
+        required: true
+        default: '0.1.91'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  npm-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Set version
+        run: |
+          VERSION="${{ inputs.version }}"
+          cd npm
+          jq --arg v "$VERSION" --arg repo "https://github.com/${{ github.repository }}" \
+            '.version = $v | .repository.url = $repo' package.npm.json > package.json
+          echo "Publishing version $VERSION"
+
+      - name: Run unit tests
+        run: |
+          cd npm
+          node --test test/test_platforms.js test/test_postinstall.js test/test_wrapper.js
+
+      - name: Pack (verify)
+        run: |
+          cd npm
+          npm pack
+
+      - name: Publish with provenance
+        run: |
+          cd npm
+          npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
