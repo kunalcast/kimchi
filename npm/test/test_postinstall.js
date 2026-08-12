@@ -395,9 +395,6 @@ describe("extractArchive", () => {
   });
 
   test("calls unzip with argument array on non-Windows", () => {
-    const origPlatform = process.platform;
-    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
-
     let calledBin, calledArgs;
     const mockSpawn = (bin, args) => {
       calledBin = bin;
@@ -407,18 +404,14 @@ describe("extractArchive", () => {
 
     extractArchive("/tmp/test.zip", "zip", "/tmp/dest", {
       spawnSyncImpl: mockSpawn,
+      platform: "darwin",
     });
 
     assert.strictEqual(calledBin, "unzip");
     assert.deepStrictEqual(calledArgs, ["-o", "/tmp/test.zip", "-d", "/tmp/dest"]);
-
-    Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
   });
 
   test("calls powershell.exe with argument array on Windows", () => {
-    const origPlatform = process.platform;
-    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-
     let calledBin, calledArgs;
     const mockSpawn = (bin, args) => {
       calledBin = bin;
@@ -428,13 +421,12 @@ describe("extractArchive", () => {
 
     extractArchive("C:\\tmp\\test.zip", "zip", "C:\\tmp\\dest", {
       spawnSyncImpl: mockSpawn,
+      platform: "win32",
     });
 
     assert.strictEqual(calledBin, "powershell.exe");
     assert.ok(Array.isArray(calledArgs));
     assert.ok(calledArgs.includes("-NoProfile"));
-
-    Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
   });
 
   test("throws on unknown archive type", () => {
@@ -460,20 +452,7 @@ describe("extractArchive", () => {
 // ---------------------------------------------------------------------------
 
 describe("makeExecutable", () => {
-  const origPlatform = process.platform;
-  let savedPlatform;
-
-  beforeEach(() => {
-    savedPlatform = process.platform;
-  });
-
-  afterEach(() => {
-    Object.defineProperty(process, "platform", { value: savedPlatform, configurable: true });
-  });
-
   test("calls chmodSync on non-Windows", () => {
-    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-
     let chmodCalled = false;
     let chmodPath, chmodMode;
     const mockChmod = (p, mode) => {
@@ -482,7 +461,7 @@ describe("makeExecutable", () => {
       chmodMode = mode;
     };
 
-    makeExecutable("/path/to/kimchi", { chmodSyncImpl: mockChmod });
+    makeExecutable("/path/to/kimchi", { chmodSyncImpl: mockChmod, platform: "linux" });
 
     assert.ok(chmodCalled);
     assert.strictEqual(chmodPath, "/path/to/kimchi");
@@ -490,14 +469,12 @@ describe("makeExecutable", () => {
   });
 
   test("does not call chmod on Windows", () => {
-    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-
     let chmodCalled = false;
     const mockChmod = () => {
       chmodCalled = true;
     };
 
-    makeExecutable("C:\\path\\to\\kimchi.exe", { chmodSyncImpl: mockChmod });
+    makeExecutable("C:\\path\\to\\kimchi.exe", { chmodSyncImpl: mockChmod, platform: "win32" });
 
     assert.ok(!chmodCalled);
   });

@@ -178,6 +178,7 @@ function defaultFetch(url, destPath, redirectsLeft = 5) {
         }
 
         const stream = createWriteStream(destPath);
+        res.on("error", reject);
         res.pipe(stream);
         stream.on("finish", () => stream.close(resolve));
         stream.on("error", reject);
@@ -316,11 +317,12 @@ function extractArchive(archivePath, archiveType, destDir, opts = {}) {
     const result = spawnSyncImpl("tar", ["-xzf", archivePath, "-C", destDir], {
       stdio: "inherit",
     });
+    if (result.error) throw result.error;
     if (result.status !== 0) {
       throw new Error(`tar extraction failed with exit code ${result.status}`);
     }
   } else if (archiveType === "zip") {
-    if (process.platform === "win32") {
+    if ((opts.platform ?? process.platform) === "win32") {
       // Use PowerShell with argument array (no string interpolation)
       const result = spawnSyncImpl(
         "powershell.exe",
@@ -331,6 +333,7 @@ function extractArchive(archivePath, archiveType, destDir, opts = {}) {
         ],
         { stdio: "inherit" }
       );
+      if (result.error) throw result.error;
       if (result.status !== 0) {
         throw new Error(`PowerShell extraction failed with exit code ${result.status}`);
       }
@@ -338,6 +341,7 @@ function extractArchive(archivePath, archiveType, destDir, opts = {}) {
       const result = spawnSyncImpl("unzip", ["-o", archivePath, "-d", destDir], {
         stdio: "inherit",
       });
+      if (result.error) throw result.error;
       if (result.status !== 0) {
         throw new Error(`unzip extraction failed with exit code ${result.status}`);
       }
@@ -351,11 +355,12 @@ function extractArchive(archivePath, archiveType, destDir, opts = {}) {
  * Makes the binary executable on Unix systems.
  *
  * @param {string} binaryPath
- * @param {{ chmodSyncImpl?: Function }} [opts]
+ * @param {{ chmodSyncImpl?: Function, platform?: string }} [opts]
  */
 function makeExecutable(binaryPath, opts = {}) {
   const chmodSyncImpl = opts.chmodSyncImpl ?? chmodSync;
-  if (process.platform !== "win32") {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") {
     chmodSyncImpl(binaryPath, 0o755);
   }
 }

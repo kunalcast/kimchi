@@ -33,7 +33,7 @@ const platforms = require("./platforms.json");
  * Resolution order:
  *   1. KIMCHI_BIN_PATH env var (explicit override)
  *   2. The downloaded binary in vendor/<platform-key>/bin/kimchi
- *   3. A system-installed `kimchi` on PATH (fallback)
+ *   3. null — caller (runKimchi) falls back to system 'kimchi' on PATH
  *
  * @param {{ platform?: string, arch?: string, existsSync?: Function }} [opts]
  * @returns {string|null} — path to the binary, or null if not found
